@@ -1,0 +1,813 @@
+\documentclass[10pt,letterpaper]{article}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage[margin=1in]{geometry}
+\usepackage[hidelinks]{hyperref}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{listings}
+\usepackage{tabularx}
+\usepackage{booktabs}
+\usepackage{authblk}
+\usepackage{enumitem}
+\usepackage[backend=biber,style=numeric,sorting=none,maxbibnames=99]{biblatex}
+\addbibresource{refs.bib}
+
+\lstset{
+    basicstyle=\ttfamily\small,
+    breaklines=true,
+    columns=fullflexible,
+    keepspaces=true,
+    showstringspaces=false,
+    frame=single,
+    rulecolor=\color{gray!40},
+    backgroundcolor=\color{gray!5},
+}
+
+\title{Live-Patching as Moving-Target Defense:\\
+Continuous In-Kernel Code Re-Randomization\\
+with Post-Supersession Honey-Trap Tripwires}
+
+\author[1]{Archis Gore}
+\affil[1]{Encrypted Execution \quad \texttt{me@archisgore.com}}
+
+\date{May 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+We observe that Linux's \texttt{CONFIG\_LIVEPATCH} subsystem ---
+originally engineered as a reboot-free transport for CVE fixes --- can
+be re-purposed as a continuous moving-target-defense (MTD) mechanism
+that periodically replaces a kernel function with a semantically
+identical copy at a different kernel-virtual address. We further
+observe that under livepatch's atomic-replace mode, the
+now-superseded code remains mapped and executable in module memory,
+forming a natural surface for kprobe-based tripwires: any control
+transfer to a previous generation's now-stale function address is, by
+construction, illegitimate, and can be logged with caller information.
+We demonstrate both ideas in a working open-source prototype,
+\emph{evasive-linux}, that streams five livepatch generations under a
+QEMU-booted Linux 6.6 kernel built with every modern randomization
+knob enabled (KASLR base and memory, \texttt{RANDSTRUCT\_FULL},
+\texttt{RANDOMIZE\_KSTACK\_OFFSET}, slab freelist randomization). A
+final attacker module deliberately dispatches a call to the first
+generation's superseded address; the honey-trap installed by the
+second generation fires and the kernel logs the intrusion with the
+caller identified. To our knowledge this is the first publicly
+documented use of the Linux livepatch subsystem as a non-CVE
+moving-target transport, and the first construction that converts
+post-supersession dead code into a tripwire. Adelie [ASPLOS 2022] is
+the closest prior work; it covers Linux modules only, uses bespoke
+remapping rather than livepatch, and does not include a deception
+component. We discuss the achievable cadence floor, the
+re-randomization-coverage question, and the engineering obstacles
+that have plausibly kept this construction unexplored to date.
+Source, dossiers, and reproducible CI at
+\url{https://github.com/encrypted-execution/evasive-linux}.
+\end{abstract}
+
+\section{Introduction}
+
+Kernel address-space layout randomization (KASLR) in mainline Linux
+is base-only and fixed at boot. Once the kernel image is decompressed
+and relocated, a single secret offset hides every function for the
+lifetime of the system. Over the last decade a string of side-channel
+attacks --- prefetch timing~\cite{hund_prefetch,gruss_prefetch}, Intel
+TSX speculative execution~\cite{drk}, Meltdown, and most recently
+EntryBleed~\cite{entrybleed} --- have shown that a determined
+attacker can recover the KASLR base with practical effort, even from
+unprivileged userspace. Once recovered, every subsequent attempt on
+the same machine benefits from the leak: the base does not change
+until reboot, and reboot in production is expensive.
+
+A natural response is to randomize \emph{continuously}: re-place
+kernel functions in memory on a schedule, so that a leaked layout
+expires before an attacker can build a code-reuse chain against it.
+This idea has a productive history in userspace ---
+TASR~\cite{tasr}, Shuffler~\cite{shuffler}, Readactor~\cite{readactor},
+RuntimeASLR~\cite{runtimeaslr}, Isomeron~\cite{isomeron},
+CodeArmor~\cite{codearmor}, Selfrando~\cite{selfrando} --- but
+strikingly little uptake in the Linux kernel. The closest kernel-side
+prior work, Adelie~\cite{adelie} (ASPLOS 2022), restricts itself to
+loadable modules and bypasses upstream Linux infrastructure entirely
+in favor of a bespoke module-remapping scheme. Function-granular
+KASLR~\cite{fgkaslr} has spent six years out-of-tree. PaX
+RANDKSTACK~\cite{pax_randkstack} re-randomizes the kernel stack base
+on every syscall but does not touch \texttt{.text}.
+
+This paper makes two observations that, taken together, change the
+engineering calculus for continuous in-kernel code rerandomization:
+
+\begin{enumerate}[leftmargin=*]
+\item Linux already ships the plumbing. The livepatch subsystem
+\cite{livepatch_docs} provides per-function code redirection via
+ftrace, a per-task consistency model that guarantees no thread is
+mid-execution in a function being swapped \cite{poimboeuf_consistency},
+and an ``atomic replace'' mode in which a new patch supersedes every
+previous one in a single transition. This infrastructure was engineered
+to deliver CVE fixes without reboots; the same primitives also serve
+as a moving-target transport. We are not aware of any prior published
+work that proposes this re-use.
+
+\item Atomic replace leaves the superseded function bodies resident
+and executable. Once a new generation is installed, the kernel's
+ftrace handler routes all legitimate callers of, say,
+\texttt{cmdline\_proc\_show} to the new replacement; the
+\emph{previous} replacement's text is no longer reached by any
+legitimate path. An attacker whose memory disclosure leaked the
+previous generation's address now holds a pointer that, if used,
+indicates malice. This is a natural surface for a kprobe-based
+tripwire, in the spirit of Crane et al.'s position
+\cite{boobytrap} that every defense should be paired with a trap.
+\end{enumerate}
+
+We contribute:
+
+\begin{itemize}[leftmargin=*]
+\item \textbf{The first working prototype} of continuous code
+re-randomization using Linux livepatch as the transport. Five
+generations of an out-of-tree livepatch module, generated from a
+template, atomic-replace one another in sequence; each lands its
+replacement at a different kernel-virtual address under unmodified
+upstream kernel infrastructure.
+\item \textbf{A novel honey-trap construction.} Each new generation
+registers a kprobe at the previous generation's now-superseded
+function entry, whose \texttt{pre\_handler} logs any control transfer
+to that location with full caller information. We demonstrate the
+trap firing end-to-end against a simulated stale-pointer attacker.
+\item \textbf{An end-to-end QEMU-reproducible demonstration} with
+CI-validated GitHub Actions workflow that builds the kernel, the
+livepatch modules, the busybox initramfs, boots the image, and
+asserts the trap log line on every push.
+\item \textbf{An honest survey of the prior art} (\S\ref{sec:related})
+across the userspace continuous-rerand line, the much sparser kernel
+line, and the deception-defense subfield, identifying two specific
+unexplored angles that this work addresses.
+\end{itemize}
+
+\paragraph{Scope and posture.} This is a research prototype, not
+production hardening. We are transparent about the engineering
+obstacles that remain (\S\ref{sec:limitations}): the convergence-cadence
+floor inherent in livepatch's consistency model, the coverage gap
+created by inlining and tail-call optimization, the consistency
+requirements of \texttt{\_\_jump\_table} and \texttt{.altinstructions}
+across rerandomizations, and the information leak posed by
+\texttt{/proc/kallsyms} and friends. We position evasive-linux as
+\emph{additive} to encrypted-linux~\cite{encrypted_linux}, the
+sibling project that applies the Encrypted Execution
+thesis~\cite{encrypted_execution} at build time: encrypted-linux
+diversifies the ABI in space (one dialect per build),
+evasive-linux diversifies code placement in time (one layout per
+cycle).
+
+\section{Background: Linux Livepatch in Detail}
+\label{sec:background}
+
+A livepatch is an ordinary kernel module marked with
+\texttt{MODULE\_INFO(livepatch, "Y")}. It declares a
+\texttt{struct klp\_patch} containing one or more
+\texttt{struct klp\_object} (one per target binary --- the running
+\texttt{vmlinux} or any patched module), each holding
+\texttt{struct klp\_func} entries that name the function to redirect
+(\texttt{old\_name}), the replacement (\texttt{new\_func}), and an
+optional \texttt{old\_sympos} to disambiguate static symbols of the
+same name. On module \texttt{init}, \texttt{klp\_enable\_patch()}
+is called.
+
+\paragraph{Redirection via ftrace.} Livepatch does not overwrite the
+prologue of the old function with a jump. It leans entirely on
+dynamic-ftrace: every function compiled with \texttt{-pg -mfentry}
+has a NOP slot at function entry that ftrace can atomically rewrite
+to a \texttt{call \_\_fentry\_\_} trampoline. To redirect
+\texttt{foo}, livepatch registers a \texttt{klp\_ftrace\_handler}
+against \texttt{foo}'s fentry site; on entry the handler rewrites
+the saved instruction pointer in \texttt{pt\_regs} to point at
+\texttt{new\_foo}. The CPU then ``returns'' from the trampoline into
+the new function. Crucially, \emph{the old function body is left
+intact in \texttt{.text}}; only the entry NOP becomes an ftrace call.
+This residue is the foundation of our honey-trap construction
+(\S\ref{sec:design}).
+
+\paragraph{The unified consistency model.} Three positions historically
+contested how to make redirection consistent across a multi-CPU,
+preemptible kernel: kpatch (Red Hat, 2014) used
+\texttt{stop\_machine} plus a per-CPU stack walk; kGraft (SUSE, 2014)
+used a per-task \texttt{TIF\_PATCH\_PENDING} flag with switchover at
+syscall boundaries; Poimboeuf's unified model
+\cite{poimboeuf_consistency} (merged in 4.12) combines them. On
+\texttt{klp\_enable\_patch}, every task is tagged
+\texttt{TIF\_PATCH\_PENDING}. A periodic worker performs reliable
+stack-tracing on each task; if no patched function appears on the
+stack, the task transitions to \texttt{KLP\_PATCHED}. Stuck tasks
+transition naturally on their next syscall return. When the last
+task has converged, \texttt{klp\_complete\_transition()} runs and
+the sysfs \texttt{enabled} flag becomes 1. This convergence is the
+floor on rerandomization cadence (\S\ref{sec:limitations}).
+
+\paragraph{Atomic replace.} A patch declared with
+\texttt{.replace = true} (introduced 2018) logically supersedes every
+previously-loaded livepatch in a single transition. After convergence,
+the older patch modules can be \texttt{rmmod}'d. This is the
+fundamental primitive evasive-linux uses: a new generation atomically
+takes over, the previous generation transitions to disabled state,
+its sysfs \texttt{enabled} file becomes 0, and its module is now a
+candidate for unload. Its \texttt{.text} remains mapped until
+\texttt{rmmod} actually runs.
+
+\paragraph{Symbol resolution.} A livepatch module needs to reference
+kernel symbols that are not exported, including static functions.
+Standard module loading cannot do that. The livepatch toolchain
+therefore emits special relocations in
+\texttt{.klp.rela.\{objname\}.\{section\}} sections that
+\texttt{klp\_resolve\_symbols()} \cite{livepatch_docs} fixes up at
+patch-enable time using kallsyms. For our purposes, the function
+\texttt{cmdline\_proc\_show} is in kallsyms with
+\texttt{CONFIG\_KALLSYMS\_ALL=y} (it is a static function in
+\texttt{fs/proc/cmdline.c}), and a single \texttt{klp\_func} entry
+naming it suffices.
+
+\section{Threat Model}
+\label{sec:threat}
+
+We assume an attacker with the following capabilities:
+\begin{itemize}[leftmargin=*]
+\item A kernel-memory \emph{disclosure} primitive sufficient to
+recover one or more kernel-text addresses (e.g., via a side channel
+of the kind that defeats stock KASLR
+\cite{hund_prefetch,gruss_prefetch,drk,entrybleed}, or via a
+controlled-read primitive in a vulnerable subsystem).
+\item A \emph{control-flow hijack} primitive separate from the
+disclosure: either a function-pointer overwrite, a kernel ROP/JOP
+chain, or a stale function-pointer cached in long-lived kernel state.
+\item Sufficient time between the disclosure and the hijack to plan
+the attack offline.
+\end{itemize}
+
+We do \emph{not} assume the attacker has:
+\begin{itemize}[leftmargin=*]
+\item Arbitrary kernel write-where (which would let them disable the
+livepatch subsystem itself).
+\item Read access to \texttt{/proc/kallsyms}, \texttt{/proc/kcore},
+perf, ftrace, or BTF (which would defeat the defense by leaking the
+new layout directly). We presume \texttt{lockdown=confidentiality}
+or equivalent.
+\item The ability to install their own livepatch (which would let
+them reverse the redirection).
+\end{itemize}
+
+The defense aims to invalidate the disclosure between the leak and
+the hijack, and to detect the hijack attempt when it happens.
+
+The construction does \emph{not} defend against:
+\begin{itemize}[leftmargin=*]
+\item Just-in-time code-reuse (JIT-ROP) \cite{jit_rop,snow_zombie}
+when the rerandomization cadence exceeds the attacker's leak-and-build
+time. Ahmed et al.\ \cite{ahmed_rerand} measured this empirically:
+function-level rerand must complete within roughly 1.5--2.4 seconds
+to stay ahead of practical JIT-ROP. Our cadence is on the slow edge
+of this regime.
+\item Data-only attacks. We move code, not data.
+\item Pure side channels that observe behavior without referencing
+specific code addresses.
+\end{itemize}
+
+\section{Design}
+\label{sec:design}
+
+\subsection{Continuous Re-Randomization via Livepatch}
+
+Treat the kernel function $f$ as a target of repeated, semantically
+identical replacement. Construct a sequence of livepatch modules
+$P_1, P_2, \ldots, P_n$, each containing a copy $f_i$ of the original
+\texttt{f} (same source, recompiled into a different module). At
+times $t_1 < t_2 < \ldots$, load $P_i$ with \texttt{.replace = true}.
+The kernel's livepatch transition installs $f_i$ as the new
+redirection target; all subsequent calls to \texttt{f} route to $f_i$.
+$f_{i-1}$ remains resident at its allocation address, no longer
+reachable through any ftrace-installed handler.
+
+The address of each $f_i$ is determined by the kernel's vmalloc-based
+module allocator. With \texttt{CONFIG\_RANDOMIZE\_MEMORY=y} the
+module region's base is randomized at boot; each subsequent
+\texttt{module\_alloc} call advances within the region. Consecutive
+$f_i$ thus land at distinct kernel-virtual addresses without
+additional engineering. We confirm this empirically
+(\S\ref{sec:eval}).
+
+\subsection{Honey-Trap on the Superseded Function}
+
+After loading $P_{i+1}$, immediately install a kprobe at the entry of
+$f_i$. The kprobe's \texttt{pre\_handler} logs the trap with the
+faulting instruction pointer (\texttt{p->addr}) and the caller
+(\texttt{regs->ip}, dereferenced via \texttt{\%pS} for symbolic
+formatting). We use kprobes rather than direct text-patching because:
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{register\_kprobe()} handles the W$\oplus$X enforcement
+internally via \texttt{text\_poke\_bp}. A module cannot ordinarily
+write to its own \texttt{.text} after load; kprobes is one of the
+few well-supported paths.
+\item The kprobe \texttt{pre\_handler} is a clean callback. It runs
+on every hit at the address. The handler can return zero (let the
+original instruction execute) or non-zero (skip), giving us policy
+flexibility we exploit in \S\ref{sec:limitations}.
+\item Unregistration is also clean: \texttt{unregister\_kprobe()}
+restores the original instruction byte and removes the trap. We do
+this on $P_{i+1}$'s \texttt{module\_exit}.
+\end{itemize}
+
+A subtle point: the kprobe installed by $P_{i+1}$ at $f_i$'s entry is
+owned by $P_{i+1}$, not by $P_i$. When $P_{i+1}$ is later superseded
+by $P_{i+2}$, the kprobe at $f_i$ remains armed (because $P_{i+1}$ is
+still loaded, only disabled as a livepatch). The trap is alive for
+as long as the module that armed it is loaded. On final teardown,
+we unload modules in reverse order ($P_n$ first), and each module's
+exit unregisters its kprobe before it goes.
+
+\subsection{Why This Is Different from Direct Text-Poking}
+
+A more direct construction would overwrite the superseded function's
+body with \texttt{INT3} (\texttt{0xCC}) or \texttt{UD2}
+(\texttt{0x0F 0x0B}) bytes via \texttt{text\_poke\_bp}, then install
+a custom \texttt{die\_notifier} to recognize hits in our poisoned
+regions. We tried this path; the engineering tax is significant
+because:
+
+\begin{enumerate}[leftmargin=*]
+\item \texttt{text\_poke}, \texttt{text\_poke\_bp}, and
+\texttt{set\_memory\_rw} are no longer exported to modules in
+mainline kernels. Workarounds (\texttt{kallsyms\_lookup\_name}
+hacks, CR0.WP toggling) are fragile and dependent on the kernel's
+self-protection posture.
+\item The \texttt{die\_notifier} approach demands a discriminator
+that recognizes our poisoned regions without false-positiving on
+legitimate BUG() or WARN() callsites.
+\item The kprobe path achieves the same observable property (trap
+fires, intrusion logged) with kernel-blessed plumbing.
+\end{enumerate}
+
+The kprobe construction we ship is therefore the practical baseline.
+The INT3-carpet variant and a synthetic-gadget-bait variant remain
+as future work for environments where finer per-byte control is
+desired (e.g., to confuse offline gadget-discovery tools like
+ROPgadget).
+
+\section{Implementation}
+\label{sec:impl}
+
+The prototype is open source at
+\url{https://github.com/encrypted-execution/evasive-linux}, Apache
+2.0 licensed. Total non-research code is approximately 600 lines of
+shell and C plus a 70-line livepatch source template.
+
+\subsection{Kernel Build}
+
+Built against Linux 6.6.30 LTS. Configuration is the upstream
+\texttt{tinyconfig} plus two fragments:
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{kernel/livepatch.config} ---
+\texttt{CONFIG\_LIVEPATCH=y}, \texttt{CONFIG\_DYNAMIC\_FTRACE\_WITH\_REGS=y},
+\texttt{CONFIG\_UNWINDER\_ORC=y}, \texttt{CONFIG\_KALLSYMS\_ALL=y},
+\texttt{CONFIG\_KPROBES=y}, \texttt{CONFIG\_OPTPROBES=y},
+\texttt{CONFIG\_MAGIC\_SYSRQ=y}, \texttt{CONFIG\_SAMPLE\_LIVEPATCH=m}.
+\item \texttt{kernel/randomize.config} --- every modern randomization
+knob: \texttt{CONFIG\_RANDOMIZE\_BASE=y} (KASLR base),
+\texttt{CONFIG\_RANDOMIZE\_MEMORY=y} (memory region bases),
+\texttt{CONFIG\_VMAP\_STACK=y}, \texttt{CONFIG\_RANDOMIZE\_KSTACK\_OFFSET=y}
+(per-syscall kernel stack offset, the
+RANDKSTACK~\cite{pax_randkstack} equivalent),
+\texttt{CONFIG\_STACKPROTECTOR\_STRONG=y},
+\texttt{CONFIG\_SLAB\_FREELIST\_RANDOM=y},
+\texttt{CONFIG\_SHUFFLE\_PAGE\_ALLOCATOR=y}, and full GCC-plugin
+struct-layout randomization (\texttt{CONFIG\_GCC\_PLUGIN\_RANDSTRUCT=y},
+\texttt{CONFIG\_RANDSTRUCT\_FULL=y}). A per-build randstruct seed is
+generated from \texttt{/dev/urandom} before the kernel is compiled.
+\end{itemize}
+
+The build runs inside a single \texttt{ubuntu:24.04}-based Docker
+container (\texttt{docker/Dockerfile.kbuild}) that stages the
+kernel source, busybox, and \texttt{gcc-13-plugin-dev} (the only
+non-trivial dependency, required for the randstruct GCC plugin).
+
+\subsection{Livepatch Module Template}
+
+\texttt{livepatches/lp\_template.c} is the source template:
+
+\begin{lstlisting}[language=C]
+static int evasive_lp_@NN@_cmdline_show(struct seq_file *m,
+                                        void *v) {
+    seq_printf(m, "evasive-linux lp_@NN@ - @MSG@\n");
+    return 0;
+}
+static struct klp_func funcs[] = {
+    { .old_name = "cmdline_proc_show",
+      .new_func = evasive_lp_@NN@_cmdline_show, }, { }
+};
+static struct klp_object objs[] = {
+    { .funcs = funcs }, { }
+};
+static struct klp_patch patch = {
+    .mod = THIS_MODULE,
+    .objs = objs,
+    .replace = true,           /* atomic-replace */
+};
+static int evasive_trap_pre_handler(struct kprobe *p,
+                                    struct pt_regs *regs) {
+    pr_warn("evasive-linux HONEY-TRAP: superseded patch @NN@ hit "
+            "at %px (caller=%pS)\n",
+            p->addr, (void *)regs->ip);
+    return 0;
+}
+static struct kprobe evasive_trap_kp = {
+    .pre_handler = evasive_trap_pre_handler,
+};
+static int __init lp_@NN@_init(void) {
+    int ret;
+    pr_info("evasive-linux lp_@NN@: new_func at %px\n",
+            evasive_lp_@NN@_cmdline_show);
+    ret = klp_enable_patch(&patch);
+    if (ret) return ret;
+    if (poison_addr) {
+        evasive_trap_kp.addr = (kprobe_opcode_t *)poison_addr;
+        ret = register_kprobe(&evasive_trap_kp);
+        if (ret == 0)
+            pr_info("HONEY-TRAP armed at %px\n",
+                    (void *)poison_addr);
+    }
+    return 0;
+}
+\end{lstlisting}
+
+The build orchestrator
+(\texttt{scripts/build-continuous-demo.sh}) materializes
+\texttt{lp\_01.c} through \texttt{lp\_05.c} from this template by
+substituting \texttt{@NN@} and \texttt{@MSG@}, then invokes
+\texttt{make -C /opt/linux M=\$PWD modules} against the just-built
+kernel tree. The five resulting \texttt{.ko} files are placed into a
+busybox initramfs.
+
+\subsection{Demo Init Script and Attacker}
+
+The initramfs \texttt{/init} loads the five generations in sequence:
+
+\begin{lstlisting}[language=bash]
+PREV=0
+for nn in 01 02 03 04 05; do
+    insmod /lib/modules/lp_${nn}.ko poison_addr=0x${PREV}
+    CUR=$(dmesg | grep "lp_${nn}: new_func"\
+        | tail -1 | awk '{print $NF}')
+    PREV=${CUR}
+done
+# Demo 03b: invoke the very first generation's stale address.
+insmod /lib/modules/attacker.ko addr=0x${FIRST_ADDR}
+\end{lstlisting}
+
+\texttt{attacker.ko} is intentionally minimal: it accepts an
+\texttt{addr} module parameter, spawns a kthread, and dispatches an
+indirect call through that address. We use a kthread rather than
+\texttt{module\_init} context so that the inevitable NULL dereference
+inside the stale \texttt{cmdline\_proc\_show} (which expects a valid
+\texttt{seq\_file *}) oopses the kthread without killing init.
+
+\subsection{Reproducibility}
+
+A GitHub Actions workflow (\texttt{.github/workflows/ci.yml}) runs
+on every push:
+
+\begin{itemize}[leftmargin=*]
+\item Three demo jobs (\texttt{demo-01}, \texttt{demo-02},
+\texttt{demo-03}) each build their respective kernel, livepatch
+modules, and initramfs, then boot in QEMU.
+\item Each job asserts the expected \texttt{dmesg} signature.
+demo-03's strict assertion is:
+\texttt{grep -q "evasive-linux HONEY-TRAP: superseded patch 02 hit"}.
+\item A hygiene job runs shellcheck across all shell scripts and
+verifies the research-dossier and config-fragment manifest.
+\end{itemize}
+
+Wall time on \texttt{ubuntu-latest} runners: 4--7 minutes per demo
+job. Anyone can verify the result with one command:
+\texttt{make demo-03}.
+
+\section{Evaluation}
+\label{sec:eval}
+
+We make claims about \emph{feasibility} and \emph{behavioral
+correctness}, not yet about microbenchmark overhead at high
+rerandomization frequencies. Open question 1
+(\S\ref{sec:limitations}) is whether the latency floor is
+practically usable; we have not yet measured it directly.
+
+\subsection{Five Distinct Placements}
+
+Captured on a clean QEMU boot:
+
+\begin{lstlisting}
+[Gen 01] insmod lp_01.ko (no honey-trap on first generation)
+         placement: 0xffffffffa0000023
+[Gen 02] insmod lp_02.ko poison_addr=0xffffffffa0000023
+         placement: 0xffffffffa0007023
+         trap:      HONEY-TRAP armed at 0xffffffffa0000023
+[Gen 03] insmod lp_03.ko poison_addr=0xffffffffa0007023
+         placement: 0xffffffffa0010023
+         trap:      HONEY-TRAP armed at 0xffffffffa0007023
+[Gen 04] insmod lp_04.ko poison_addr=0xffffffffa0010023
+         placement: 0xffffffffa0019023
+         trap:      HONEY-TRAP armed at 0xffffffffa0010023
+[Gen 05] insmod lp_05.ko poison_addr=0xffffffffa0019023
+         placement: 0xffffffffa0020023
+         trap:      HONEY-TRAP armed at 0xffffffffa0019023
+\end{lstlisting}
+
+Each generation lands at a distinct kernel-virtual address. The
+inter-generation delta (0x6000--0x9000 bytes) is the module allocator's
+natural padding plus per-module sections; no extra entropy is
+required beyond the underlying KASLR.
+
+\subsection{Honey-Trap Fires}
+
+Continuing the same boot, the attacker module is loaded and dispatches
+a call to the very first generation's address:
+
+\begin{lstlisting}
+Loading attacker.ko addr=0xffffffffa0000023
+  attacker: dispatching call to 0xffffffffa0000023 ...
+  evasive-linux HONEY-TRAP: superseded patch 02 hit at
+        0xffffffffa0000027 (caller=evasive_lp_01_cmdline_show
+                                  +0x5/0x18 [lp_01])
+\end{lstlisting}
+
+The trap message confirms the kprobe installed by generation 02 (at
+the entry of generation 01's superseded function) fired on the
+attacker's indirect call. The address reported by the trap
+(\texttt{0xffffffffa0000027}) is offset 4 from the function entry
+(\texttt{0xffffffffa0000023}); the offset corresponds to the
+\texttt{endbr64} instruction inserted by the kernel's IBT-enabled
+build, after which the kprobe is allowed to attach.
+
+\subsection{Clean Disarm}
+
+On demo teardown, modules are \texttt{rmmod}'d in reverse order. Each
+unload prints its trap-disarm message:
+
+\begin{lstlisting}
+evasive-linux lp_05: HONEY-TRAP at 0xffffffffa0019027 disarmed
+evasive-linux lp_04: HONEY-TRAP at 0xffffffffa0010027 disarmed
+evasive-linux lp_03: HONEY-TRAP at 0xffffffffa0007027 disarmed
+evasive-linux lp_02: HONEY-TRAP at 0xffffffffa0000027 disarmed
+\end{lstlisting}
+
+\subsection{KASLR-on-KASLR}
+
+The kernel is built with the full randomization stack
+(\texttt{RANDSTRUCT\_FULL}, \texttt{RANDOMIZE\_BASE},
+\texttt{RANDOMIZE\_MEMORY}, \texttt{VMAP\_STACK},
+\texttt{RANDOMIZE\_KSTACK\_OFFSET}). Across boots, the module region's
+base shifts, so the absolute generation addresses are different from
+the example above; the inter-generation deltas remain similar. The
+livepatch-driven re-randomization stacks atop boot-time randomization
+multiplicatively: an attacker who somehow recovers KASLR base still
+faces fresh per-generation placement.
+
+\section{Limitations and Open Questions}
+\label{sec:limitations}
+
+\subsection{Cadence Floor}
+
+The unified consistency model \cite{poimboeuf_consistency} converges
+``usually within a few seconds'' per upstream documentation. The
+lower bound is governed by long-sleeping kernel threads
+(\texttt{kthreadd}, idle workers) and IPI cost. Sysfs exposes a
+\texttt{force} knob to break stuck transitions. Practical cadence is
+plausibly 1--10 seconds per cycle; sub-second is probably out of
+reach with the current consistency model. JIT-ROP measurements
+\cite{ahmed_rerand} place the danger threshold at 1.5--2.4 seconds
+for function-level rerand, so this defense is on the slow edge of
+the regime. Block-granular re-randomization within livepatch (in the
+spirit of Remix \cite{remix}) is a natural next step.
+
+\subsection{Coverage Gap}
+
+Not every kernel function is re-randomizable. Subtract:
+
+\begin{itemize}[leftmargin=*]
+\item Functions inlined at every callsite. Per-function patching
+becomes a no-op; transitive-closure analysis is required (kpatch's
+classic problem).
+\item Tail-call-optimized callers. A tail call (\texttt{jmp foo})
+skips the fentry NOP; livepatch's redirect doesn't fire.
+\texttt{-fno-optimize-sibling-calls} mitigates at a performance
+cost.
+\item Functions on any \texttt{kthread}'s perpetual sleep stack
+(scheduler core, RCU, IRQ entry). The consistency model refuses to
+transition while these are mid-execution; they are effectively
+unpatchable.
+\item Functions with active \texttt{kprobe} or \texttt{eBPF} attachments.
+Livepatch and kprobes are mutually exclusive on the same function via
+\texttt{FTRACE\_OPS\_FL\_IPMODIFY}. A re-randomization cycle must
+either evict probes and reinstate them, or skip those functions.
+\end{itemize}
+
+Our hypothesis: 60--80\% of \texttt{vmlinux} by function count is
+re-randomizable in the limit; the remainder defines the static
+attack surface that this defense does not move.
+
+\subsection{Consistency of Patched-In Addresses}
+
+A re-randomization cycle that moves a function's code also
+invalidates any place its address is hard-coded:
+
+\begin{itemize}[leftmargin=*]
+\item \texttt{\_\_jump\_table} entries (static keys / jump labels).
+\item \texttt{.altinstructions} (CPU-feature-conditional code
+patches).
+\item Paravirt op tables (\texttt{pv\_ops}, inline-patched in
+some configurations).
+\item Function-pointer fields in long-lived kernel data
+structures (\texttt{file\_operations}, \texttt{net\_device\_ops}, the
+syscall table, etc.).
+\end{itemize}
+
+A complete implementation must walk and rewrite all of these on every
+cycle. The current prototype handles only the simple case (a single
+non-aliased function); generalization is the central engineering
+challenge.
+
+\subsection{Information Leakage}
+
+\texttt{/proc/kallsyms}, \texttt{/proc/kcore}, perf samples, ftrace
+ring-buffer entries, and BTF all expose the new layout to anyone
+with appropriate privileges. The defense presumes
+\texttt{lockdown=confidentiality} or equivalent posture; root-or-
+equivalent disclosure defeats it. Whether the disclosure primitives
+that motivated continuous rerand (e.g., EntryBleed
+\cite{entrybleed}) survive lockdown is itself an open question.
+
+\subsection{Memory and Module-Slot Pressure}
+
+Every cycle leaves a stale module loaded. Atomic-replace plus
+periodic \texttt{rmmod} keeps the steady-state count bounded, but
+each cycle pays for new module allocation, BTF generation, and
+kallsyms churn. Long-running systems may exhaust module slot space
+or fragment the module address region; mitigation likely requires a
+custom slot recycler.
+
+\section{Related Work}
+\label{sec:related}
+
+\subsection{Userspace Continuous Code Rerandomization}
+
+A productive decade of work: TASR \cite{tasr} re-randomizes on
+I/O-boundary events on the insight that disclosure becomes dangerous
+only when its result crosses a trust boundary. Shuffler \cite{shuffler}
+runs an asynchronous shuffle thread in-process and demonstrates
+millisecond-cadence on x86\_64 with 7--15\% overhead. Readactor
+\cite{readactor} pairs randomization with execute-only memory and
+trampoline indirection. Isomeron \cite{isomeron} flips a coin per
+indirect call between two semantically identical replicas. CodeArmor
+\cite{codearmor} virtualizes the entire code space and seeds honey
+gadgets into it (the closest userspace cousin of our work). RuntimeASLR
+\cite{runtimeaslr} remaps the post-\texttt{fork} child to defeat
+BlindROP. Stabilizer \cite{stabilizer} introduced the rerand-as-PRNG
+methodology for benchmarking. Smokestack \cite{smokestack} extends to
+the stack. CoDaRR \cite{codarr} extends to data masks. None of these
+target the kernel.
+
+\subsection{Kernel-Side Rerandomization}
+
+This is the sparse part of the literature. Giuffrida et al.\
+\cite{giuffrida} demonstrate continuous rerand of the MINIX 3
+microkernel with 5\% steady-state overhead, 10\% at 5-second cadence;
+the microkernel design is essential to their approach. KASLR in
+mainline Linux is base-only and broken by a sequence of side-channel
+attacks \cite{hund_prefetch,gruss_prefetch,drk,entrybleed}. FGKASLR
+\cite{fgkaslr} extends to function granularity at boot time only; it
+has remained out-of-tree for six years. kMVX \cite{kmvx} runs
+diversified kernels in parallel under N-variant execution to detect
+leaks; kRX \cite{krx} provides execute-only memory; KHide \cite{khide}
+adds disclosure-resistant diversification. All are orthogonal or
+complementary to evasive-linux. PaX RANDKSTACK \cite{pax_randkstack}
+shuffles the per-task kernel stack pointer every syscall; it is the
+only continuous rerand mechanism shipping in production Linux and
+serves as a useful precedent. Morpheus \cite{morpheus} demonstrates
+50-millisecond pointer-encryption churn in a custom secure processor;
+it survived a DARPA FETT bug bounty with $\sim$1\% overhead and is the
+strongest existence proof that high-frequency MTD is affordable
+\emph{in silicon}.
+
+\paragraph{Adelie \cite{adelie}.} The closest published work. Adelie
+re-randomizes Linux \emph{modules} via a bespoke remapping scheme
+(custom PIC compilation plus an out-of-tree address-encryption layer)
+on seconds-scale cadence. It does not target \texttt{vmlinux}, does
+not use the livepatch subsystem, and does not include a deception
+layer. We view evasive-linux as a complementary point in the design
+space: where Adelie offers a self-contained module-only system,
+evasive-linux re-uses Linux's own livepatch infrastructure, addresses
+both modules and \texttt{vmlinux} in principle (limited in our
+prototype to the simple case), and adds the honey-trap construction.
+
+\subsection{Deception Defense}
+
+Crane et al.'s position paper \cite{boobytrap} argues that every
+defense should be paired with a trap: cancel the attack and log it.
+HoneyGadget \cite{honeygadget} inserts gadget-shaped decoys at build
+time and detects via Intel LBR sampling; CodeArmor \cite{codearmor}
+seeds honey gadgets into its virtualized code space. Neither uses
+the post-supersession dead code left by livepatch's atomic-replace as
+the deception surface. Detection-only approaches (ROPscan, kBouncer
+\cite{kbouncer}) verify return targets but do not trap. We are
+unaware of prior published work that proposes the specific
+construction: \emph{after a function is redirected by livepatch,
+register a kprobe at the now-unreachable previous-generation entry as
+an intrusion tripwire}.
+
+\subsection{Build-Time Diversification}
+
+Selfrando \cite{selfrando} performs load-time function permutation
+in Tor Browser. encrypted-linux \cite{encrypted_linux}, the sibling
+project, applies the Encrypted Execution thesis
+\cite{encrypted_execution} at every contract point of the user-space
+ABI and kernel UAPI --- syscall numbers, x86\_64 calling convention,
+errno values, \texttt{/proc} schema, ELF \texttt{EI\_OSABI}, struct
+layouts --- producing a different machine-level dialect per build.
+That is the orthogonal axis: build-time spatial diversification.
+evasive-linux adds runtime temporal diversification. Stacked, the two
+defenses force an attacker to recover both the build's dialect and
+the current generation's layout.
+
+\section{Discussion}
+\label{sec:discussion}
+
+\paragraph{Why hasn't this been built?} Probably four reasons,
+combined: (1) the \texttt{\_\_jump\_table} / \texttt{.altinstructions}
+consistency engineering is non-trivial; (2) JIT-ROP \cite{jit_rop}
+established a perception that any sub-instruction-granularity rerand
+is insufficient against a determined attacker with disclosure
+capability; (3) the Linux livepatch maintainer community has stayed
+focused on the original CVE-fix use case; (4) Adelie \cite{adelie}
+filled the seconds-cadence kernel-module niche just recently and
+established a viable competitor that doesn't require livepatch
+expertise to extend.
+
+\paragraph{Why is the trap interesting on its own?} Because it
+inverts a fundamental property of code-reuse attacks. In a static
+KASLR world, a leaked function pointer is a useful pointer: it
+identifies a callable entry. After livepatch supersession, a leaked
+function pointer is an \emph{antagonistic signal}: its only legitimate
+use vanished the moment the new generation took over. Any future
+control flow toward that address is, by construction, malicious. The
+defender's instrumentation cost is fixed (one kprobe per superseded
+generation); the attacker's loss of optionality compounds with the
+number of past generations.
+
+\paragraph{Where the construction wants to go.} We see four natural
+extensions: (a) drive the rerandomization loop from inside the kernel
+(a workqueue that periodically inserts the next pre-built generation
+via \texttt{request\_module}); (b) generate the next generation's
+source code on demand at each tick, so the binary is genuinely
+different not just located differently (composes cleanly with
+encrypted-linux's per-build dialect); (c) add a synthetic-gadget
+honey-bait variant that pollutes the offline ROP-discovery output of
+tools like ROPgadget; (d) extend coverage by integrating Remix-style
+\cite{remix} basic-block shuffling within each generation. Each is
+an independent research project.
+
+\section{Conclusion}
+\label{sec:conclusion}
+
+The Linux kernel ships, today, with the precise infrastructure
+required to continuously re-randomize its own \texttt{.text}: per-function
+ftrace-driven redirection, a transitional consistency model, and
+atomic-replace for cumulative patches. It was engineered for CVE
+hot-fixing, but it is also a moving-target transport. The dead code
+left behind by atomic-replace is not waste; it is a perfectly-shaped
+honey surface, and a kprobe at its entry converts a stale function
+pointer in an attacker's working memory from a useful gadget into a
+self-incriminating signal. Both observations appear to be unexplored
+in the literature, and both fit naturally with mainline Linux.
+
+We have demonstrated the construction end-to-end. The prototype is
+small, open, CI-validated, and reproducible in fifteen minutes with
+one command. The interesting questions --- how fast can we cycle,
+how much of \texttt{vmlinux} can we cover, how to keep
+\texttt{\_\_jump\_table} consistent across cycles --- are now
+concrete engineering problems on top of a working baseline rather
+than open theoretical questions.
+
+\paragraph{Availability.} Source, research dossiers, and
+reproducible CI:
+\url{https://github.com/encrypted-execution/evasive-linux}.
+
+\paragraph{Acknowledgments.} The author thanks the upstream livepatch
+maintainers --- Josh Poimboeuf, Joe Lawrence, Jiri Kosina, Petr
+Mladek, Miroslav Benes --- whose work made this construction possible.
+The patent underlying this work (USPTO 10,733,303) is publicly
+pledged to the public domain.
+
+\printbibliography
+
+\end{document}
