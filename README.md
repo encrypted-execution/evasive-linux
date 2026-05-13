@@ -66,8 +66,63 @@ Captured boot output:
        function at a different location in the module address space.
 ```
 
-The repository also holds three research/prior-art dossiers
-(`research/00`, `01`, `02`) that establish the project thesis.
+### Demo 03 + 03b — continuous rerandomization + working honey-traps
+
+The full thesis. A kernel built with **every randomization knob enabled**
+(KASLR via `RANDOMIZE_BASE`, `RANDOMIZE_MEMORY`, `VMAP_STACK`,
+`RANDOMIZE_KSTACK_OFFSET`, slab freelist randomization, full GCC
+`RANDSTRUCT_FULL`). Five livepatch generations (`lp_01.ko` ... `lp_05.ko`)
+atomic-replace each other in sequence. Each new generation arms a
+**kprobe-based honey-trap** at the previous generation's now-superseded
+function address. A final `attacker.ko` deliberately invokes the very
+first generation's stale pointer — the trap fires, the intrusion is
+logged, with the caller identified.
+
+```bash
+bash scripts/build-continuous-demo.sh   # ~15 min
+INITRD=build/rootfs-continuous.cpio.gz bash scripts/run-qemu.sh
+```
+
+Sample boot output (abridged):
+
+```
+kprobes: kprobe jump-optimization is enabled. All kprobes are optimized if possible.
+
+[Gen 01] insmod lp_01.ko (no honey-trap on first generation)
+         placement: ffffffffa0000023
+
+[Gen 02] insmod lp_02.ko poison_addr=0xffffffffa0000023
+         placement: ffffffffa0007023
+         trap:      HONEY-TRAP armed at ffffffffa0000023
+
+[Gen 03] insmod lp_03.ko poison_addr=0xffffffffa0007023
+         placement: ffffffffa0010023
+         trap:      HONEY-TRAP armed at ffffffffa0007023
+
+[Gen 04] insmod lp_04.ko poison_addr=0xffffffffa0010023
+         placement: ffffffffa0019023
+         trap:      HONEY-TRAP armed at ffffffffa0010023
+
+[Gen 05] insmod lp_05.ko poison_addr=0xffffffffa0019023
+         placement: ffffffffa0020023
+         trap:      HONEY-TRAP armed at ffffffffa0019023
+
+Loading attacker.ko addr=0xffffffffa0000023
+  attacker: dispatching call to ffffffffa0000023 ...
+  evasive-linux HONEY-TRAP: superseded patch 02 hit at ffffffffa0000027 (caller=evasive_lp_01_cmdline_show+0x5/0x18 [lp_01])
+```
+
+That last `HONEY-TRAP: ... hit at ...` line is the thesis running
+end-to-end: code that the attacker remembered from a previous generation
+is no longer where the kernel routes anyone legitimate. When the
+attacker reaches for that stale address, the kernel logs the event with
+the caller identified. **Every cycle leaves a tripwire.**
+
+### Research / prior art
+
+The repository also holds three dossiers (`research/00`, `01`, `02`)
+that establish the project thesis with academic and industry literature
+surveys.
 
 ## The thesis in one minute
 

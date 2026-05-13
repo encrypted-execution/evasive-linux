@@ -15,7 +15,7 @@ KERNEL="${KERNEL:-build/bzImage}"
 INITRD="${INITRD:-build/rootfs.cpio.gz}"
 # no_hash_pointers makes %px and %p print raw kernel addresses, which
 # we need for demo 02 (proving two patches land at distinct addresses).
-APPEND="${APPEND:-console=ttyS0 panic=5 loglevel=3 no_hash_pointers}"
+APPEND="${APPEND:-console=ttyS0 panic=5 loglevel=7 no_hash_pointers}"
 
 # Pick gtimeout on macOS, timeout on Linux.
 if command -v gtimeout >/dev/null 2>&1; then

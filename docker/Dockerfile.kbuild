@@ -10,7 +10,12 @@
 FROM --platform=linux/amd64 ubuntu:24.04
 
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends \
+# Enable Ubuntu universe so gcc-13-plugin-dev is available (needed for
+# CONFIG_GCC_PLUGIN_RANDSTRUCT — struct-layout randomization is part of
+# "all randomizing possible").
+RUN sed -i 's/Components: main$/Components: main universe/' \
+        /etc/apt/sources.list.d/ubuntu.sources && \
+    apt-get update && apt-get install -y --no-install-recommends \
         build-essential \
         bc bison flex \
         libelf-dev libssl-dev \
@@ -22,6 +27,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         kmod \
         file \
         git \
+        gcc-13-plugin-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Linux kernel — same LTS as encrypted-linux.
