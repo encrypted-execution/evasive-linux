@@ -20,11 +20,35 @@ every cycle.
 
 ## Status
 
-**Research, pre-prototype.** The repository currently holds the
-threat-model and prior-art dossiers (`research/00`, `01`, `02`). No
-working code yet — the deliverable for the first milestone is a livepatch
-module that demonstrably re-randomizes a single non-critical function
-under load.
+**Demo 01 — single livepatch — working end-to-end in QEMU.** Vanilla
+Linux 6.6.30 + `CONFIG_LIVEPATCH` + the kernel's own
+`samples/livepatch/livepatch-sample.ko`. The init script loads the
+patch, shows `/proc/cmdline` change from the real boot cmdline to
+`this has been live patched`, disables the patch, shows the revert,
+and `rmmod`s cleanly.
+
+```bash
+bash scripts/build-livepatch-demo.sh   # ~10 min, builds kernel + busybox + .ko + initramfs
+bash scripts/run-qemu.sh               # boots in QEMU, demo runs, machine poweroffs
+```
+
+Expected output (abridged):
+
+```
+[1] Baseline /proc/cmdline:    console=ttyS0 panic=5 loglevel=3
+[2] Loading livepatch-sample.ko ...
+    -> insmod exit 0
+    livepatch sysfs:  livepatch_sample
+    transition=0      enabled=1
+[3] Patched /proc/cmdline:    this has been live patched
+[4] Disabling the livepatch ...
+[5] Reverted /proc/cmdline:   console=ttyS0 panic=5 loglevel=3
+[6] Unloading patch module ...
+    -> rmmod exit 0
+```
+
+The repository also holds the three research/prior-art dossiers
+(`research/00`, `01`, `02`) that establish the project thesis.
 
 ## The thesis in one minute
 

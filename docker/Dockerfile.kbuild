@@ -1,0 +1,44 @@
+# Dockerfile.kbuild — vanilla-Linux build environment for evasive-linux.
+#
+# Stages Linux 6.6.30 (matches encrypted-linux for inter-project
+# alignment) and busybox 1.36.1. No scrambling, no encrypted-linux
+# patches — just an ordinary kernel build environment that we use to
+# produce a livepatch-enabled image.
+#
+# Build:  docker build -t evasive-linux-kbuild -f docker/Dockerfile.kbuild .
+
+FROM --platform=linux/amd64 ubuntu:24.04
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        bc bison flex \
+        libelf-dev libssl-dev \
+        ncurses-dev \
+        wget xz-utils ca-certificates \
+        cpio gzip \
+        rsync \
+        python3 \
+        kmod \
+        file \
+        git \
+    && rm -rf /var/lib/apt/lists/*
+
+# Linux kernel — same LTS as encrypted-linux.
+ARG LINUX_VERSION=6.6.30
+ARG LINUX_URL=https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${LINUX_VERSION}.tar.xz
+WORKDIR /opt
+RUN wget -q "${LINUX_URL}" -O linux.tar.xz && \
+    tar -xJf linux.tar.xz && \
+    mv linux-${LINUX_VERSION} linux && \
+    rm linux.tar.xz
+
+# Busybox — for /sbin/init, insmod, rmmod, cat in the demo initramfs.
+ARG BUSYBOX_VERSION=1.36.1
+ARG BUSYBOX_URL=https://busybox.net/downloads/busybox-${BUSYBOX_VERSION}.tar.bz2
+RUN wget -q "${BUSYBOX_URL}" -O busybox.tar.bz2 && \
+    tar -xjf busybox.tar.bz2 && \
+    mv busybox-${BUSYBOX_VERSION} busybox && \
+    rm busybox.tar.bz2
+
+WORKDIR /work
