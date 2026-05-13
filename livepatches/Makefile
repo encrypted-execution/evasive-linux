@@ -1,22 +1,22 @@
 # Makefile for evasive-linux out-of-tree livepatch modules.
 #
-# Demo 02 modules (hand-written): lp1.o, lp2.o
-# Demo 03 modules (generated from lp_template.c): lp_01.o ... lp_05.o
-# Demo 03 attacker module: attacker.o
+# Demo 02 modules (hand-written, always present): lp1.c, lp2.c
+# Demo 03 modules: lp_01.c ... lp_05.c — generated from lp_template.c
+#                  by scripts/build-continuous-demo.sh before this
+#                  Makefile is invoked. NOT present in the source tree.
+# Demo 03b attacker module: attacker.c (always present)
 #
-# The generated lp_NN.c files are produced by the orchestrator script
-# before invoking `make -C /opt/linux M=$PWD modules`.
+# The lp_NN.o entries are added conditionally — only when the matching
+# .c files exist in $(M). This lets demo 02's build (which doesn't
+# generate the template) succeed without complaining about missing
+# lp_01.c .. lp_05.c.
 
-# Demo 02 — kept for backward compatibility.
+# Always-built modules.
 obj-m += lp1.o
 obj-m += lp2.o
-
-# Demo 03 — 5 generations of evasive-linux livepatches.
-obj-m += lp_01.o
-obj-m += lp_02.o
-obj-m += lp_03.o
-obj-m += lp_04.o
-obj-m += lp_05.o
-
-# Demo 03b — simulated stale-pointer attacker.
 obj-m += attacker.o
+
+# Generated modules — only when present.
+ifneq ($(wildcard $(M)/lp_01.c),)
+obj-m += lp_01.o lp_02.o lp_03.o lp_04.o lp_05.o
+endif

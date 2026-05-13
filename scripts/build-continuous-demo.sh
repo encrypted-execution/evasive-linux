@@ -235,8 +235,11 @@ done
 
 echo
 echo "==============================================================="
-echo "  Demo complete. Poweroff."
+echo "  Demo complete. Triggering emergency reboot (sysrq b) — QEMU"
+echo "  -no-reboot will intercept and exit cleanly."
 echo "==============================================================="
+echo 1 > /proc/sys/kernel/sysrq 2>/dev/null
+echo b > /proc/sysrq-trigger
 /bin/busybox poweroff -f
 INIT
 chmod +x "${ROOT}/init"
