@@ -20,34 +20,53 @@ every cycle.
 
 ## Status
 
-**Demo 01 — single livepatch — working end-to-end in QEMU.** Vanilla
-Linux 6.6.30 + `CONFIG_LIVEPATCH` + the kernel's own
-`samples/livepatch/livepatch-sample.ko`. The init script loads the
-patch, shows `/proc/cmdline` change from the real boot cmdline to
-`this has been live patched`, disables the patch, shows the revert,
-and `rmmod`s cleanly.
+**Two demos working end-to-end in QEMU.**
+
+### Demo 01 — single livepatch
+
+Vanilla Linux 6.6.30 + `CONFIG_LIVEPATCH` + the kernel's own
+`samples/livepatch/livepatch-sample.ko`. Loads the patch, shows
+`/proc/cmdline` change from the real boot cmdline to
+`this has been live patched`, disables, observes the revert, `rmmod`s.
 
 ```bash
-bash scripts/build-livepatch-demo.sh   # ~10 min, builds kernel + busybox + .ko + initramfs
-bash scripts/run-qemu.sh               # boots in QEMU, demo runs, machine poweroffs
+bash scripts/build-livepatch-demo.sh   # ~10 min
+bash scripts/run-qemu.sh
 ```
 
-Expected output (abridged):
+### Demo 02 — two livepatches at distinct addresses
 
-```
-[1] Baseline /proc/cmdline:    console=ttyS0 panic=5 loglevel=3
-[2] Loading livepatch-sample.ko ...
-    -> insmod exit 0
-    livepatch sysfs:  livepatch_sample
-    transition=0      enabled=1
-[3] Patched /proc/cmdline:    this has been live patched
-[4] Disabling the livepatch ...
-[5] Reverted /proc/cmdline:   console=ttyS0 panic=5 loglevel=3
-[6] Unloading patch module ...
-    -> rmmod exit 0
+The foundational property required for continuous code re-randomization:
+each consecutive livepatch places its replacement function at a
+*different* kernel virtual address. Two out-of-tree modules
+(`livepatches/lp1.c`, `livepatches/lp2.c`) each replace
+`cmdline_proc_show` and print their own function pointer via `pr_info`.
+
+```bash
+bash scripts/build-double-livepatch-demo.sh   # ~10 min
+INITRD=build/rootfs-double.cpio.gz bash scripts/run-qemu.sh
 ```
 
-The repository also holds the three research/prior-art dossiers
+Captured boot output:
+
+```
+[2] insmod lp1.ko ...
+    /proc/cmdline now:    evasive-linux lp1 — patch #1
+    lp1 placement (from dmesg): ffffffffa0000032
+
+[3] insmod lp2.ko (atomic-replace) ...
+    /proc/cmdline now:    evasive-linux lp2 — patch #2
+    lp2 placement (from dmesg): ffffffffa0006032
+    lp1 sysfs (auto-disabled by atomic-replace): enabled=
+
+[4] Verdict:
+    lp1: ffffffffa0000032
+    lp2: ffffffffa0006032
+    -> DISTINCT addresses. Each livepatch placed its replacement
+       function at a different location in the module address space.
+```
+
+The repository also holds three research/prior-art dossiers
 (`research/00`, `01`, `02`) that establish the project thesis.
 
 ## The thesis in one minute

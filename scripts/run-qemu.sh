@@ -11,6 +11,11 @@ cd "${REPO_ROOT}"
 
 TIMEOUT="${TIMEOUT:-90}"
 MEM="${MEM:-2G}"
+KERNEL="${KERNEL:-build/bzImage}"
+INITRD="${INITRD:-build/rootfs.cpio.gz}"
+# no_hash_pointers makes %px and %p print raw kernel addresses, which
+# we need for demo 02 (proving two patches land at distinct addresses).
+APPEND="${APPEND:-console=ttyS0 panic=5 loglevel=3 no_hash_pointers}"
 
 # Pick gtimeout on macOS, timeout on Linux.
 if command -v gtimeout >/dev/null 2>&1; then
@@ -24,7 +29,7 @@ fi
 
 exec "${TO}" "${TIMEOUT}" qemu-system-x86_64 \
     -m "${MEM}" \
-    -kernel build/bzImage \
-    -initrd build/rootfs.cpio.gz \
-    -append "console=ttyS0 panic=5 loglevel=3" \
+    -kernel "${KERNEL}" \
+    -initrd "${INITRD}" \
+    -append "${APPEND}" \
     -nographic -no-reboot -accel tcg
