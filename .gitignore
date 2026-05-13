@@ -1,5 +1,27 @@
+# Build outputs
 build/
-build.log
+*.log
+
+# Driver scripts the orchestrators leave behind on failure
 tmp-*.sh
-build-double.log
-build-continuous.log
+
+# Template-generated source (rematerialized by the build script)
+livepatches/lp_0?.c
+
+# Kbuild intermediates (if anyone runs make in livepatches/ outside docker)
+livepatches/*.o
+livepatches/*.ko
+livepatches/.*.cmd
+livepatches/*.mod
+livepatches/*.mod.c
+livepatches/Module.symvers
+livepatches/modules.order
+livepatches/.tmp_versions/
+
+# Editor / OS detritus
+.DS_Store
+*~
+*.swp
+*.swo
+.vscode/
+.idea/

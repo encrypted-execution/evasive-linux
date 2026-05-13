@@ -1,0 +1,220 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # ──────────────────────────────────────────────────────────────────
+  # Demo 01 — single livepatch end-to-end.
+  # ──────────────────────────────────────────────────────────────────
+  demo-01:
+    name: Demo 01 — single livepatch
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install QEMU + coreutils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-system-x86 coreutils
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build evasive-linux-kbuild image
+        run: |
+          docker buildx build --load \
+              -t evasive-linux-kbuild \
+              -f docker/Dockerfile.kbuild .
+
+      - name: Build demo 01 (kernel + in-tree livepatch sample + initramfs)
+        run: bash scripts/build-livepatch-demo.sh
+
+      - name: Boot demo 01 in QEMU and assert success
+        run: |
+          set -o pipefail
+          bash scripts/run-qemu.sh 2>&1 | tee build/qemu-01.log
+          grep -q "this has been live patched" build/qemu-01.log \
+              || (echo "FAIL: livepatch did not change /proc/cmdline"; tail -40 build/qemu-01.log; exit 1)
+          grep -q "Reverted /proc/cmdline" build/qemu-01.log \
+              || (echo "FAIL: revert step missing"; tail -40 build/qemu-01.log; exit 1)
+          echo "Demo 01: PASS"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: demo-01
+          path: |
+            build/bzImage
+            build/livepatch-sample.ko
+            build/rootfs.cpio.gz
+            build/qemu-01.log
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # Demo 02 — two livepatches, distinct addresses.
+  # ──────────────────────────────────────────────────────────────────
+  demo-02:
+    name: Demo 02 — two livepatches at distinct addresses
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install QEMU + coreutils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-system-x86 coreutils
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build evasive-linux-kbuild image
+        run: |
+          docker buildx build --load \
+              -t evasive-linux-kbuild \
+              -f docker/Dockerfile.kbuild .
+
+      - name: Build demo 02 (kernel + lp1.ko + lp2.ko + initramfs)
+        run: bash scripts/build-double-livepatch-demo.sh
+
+      - name: Boot demo 02 and assert distinct addresses
+        run: |
+          set -o pipefail
+          INITRD=build/rootfs-double.cpio.gz bash scripts/run-qemu.sh 2>&1 | tee build/qemu-02.log
+          grep -q "DISTINCT addresses" build/qemu-02.log \
+              || (echo "FAIL: two livepatches did not land at distinct addresses"; tail -40 build/qemu-02.log; exit 1)
+          # Sanity-check the addresses themselves are present and different.
+          LP1=$(grep "evasive-linux lp1: new_func" build/qemu-02.log | awk '{print $NF}' | tail -1)
+          LP2=$(grep "evasive-linux lp2: new_func" build/qemu-02.log | awk '{print $NF}' | tail -1)
+          test -n "${LP1}" -a -n "${LP2}" -a "${LP1}" != "${LP2}" \
+              || (echo "FAIL: lp1=${LP1} lp2=${LP2}"; exit 1)
+          echo "Demo 02: PASS (lp1=${LP1} lp2=${LP2})"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: demo-02
+          path: |
+            build/bzImage
+            build/lp1.ko
+            build/lp2.ko
+            build/rootfs-double.cpio.gz
+            build/qemu-02.log
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # Demo 03 + 03b — continuous rerandomization + honey-traps.
+  # ──────────────────────────────────────────────────────────────────
+  demo-03:
+    name: Demo 03 — continuous rerand + honey-trap fire
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install QEMU + coreutils
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y qemu-system-x86 coreutils
+
+      - name: Set up Docker buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build evasive-linux-kbuild image (+gcc-13-plugin-dev)
+        run: |
+          docker buildx build --load \
+              -t evasive-linux-kbuild \
+              -f docker/Dockerfile.kbuild .
+
+      - name: Build demo 03 (kernel + all randomization + 5 generations + attacker)
+        run: bash scripts/build-continuous-demo.sh
+
+      - name: Boot demo 03 and assert trap fires
+        run: |
+          set -o pipefail
+          TIMEOUT=180 INITRD=build/rootfs-continuous.cpio.gz \
+              bash scripts/run-qemu.sh 2>&1 | tee build/qemu-03.log
+          # 5 distinct placements.
+          for nn in 01 02 03 04 05; do
+              grep -q "evasive-linux lp_${nn}: new_func at" build/qemu-03.log \
+                  || (echo "FAIL: lp_${nn} did not announce its placement"; tail -50 build/qemu-03.log; exit 1)
+          done
+          # 4 armed traps (generations 02..05 each arm a trap at the prior).
+          for nn in 02 03 04 05; do
+              grep -q "evasive-linux lp_${nn}: HONEY-TRAP armed at" build/qemu-03.log \
+                  || (echo "FAIL: lp_${nn} did not arm honey-trap"; tail -50 build/qemu-03.log; exit 1)
+          done
+          # The killshot: attacker invocation fires the trap installed by lp_02.
+          grep -q "evasive-linux HONEY-TRAP: superseded patch 02 hit at" build/qemu-03.log \
+              || (echo "FAIL: honey-trap did not fire on attacker invocation"; tail -50 build/qemu-03.log; exit 1)
+          echo "Demo 03: PASS"
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: demo-03
+          path: |
+            build/bzImage
+            build/lp_*.ko
+            build/attacker.ko
+            build/rootfs-continuous.cpio.gz
+            build/qemu-03.log
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────────────
+  # Repository hygiene — fast lane.
+  # ──────────────────────────────────────────────────────────────────
+  hygiene:
+    name: Repo hygiene (shell + docs)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: shellcheck on scripts/
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y shellcheck
+          # Allow exit-on-error in scripts; lint with default warnings.
+          # SC2086 (word splitting on $PARAM_ARG) is intentional, exclude.
+          shellcheck -e SC2086 scripts/*.sh
+
+      - name: Validate all required research dossiers exist
+        run: |
+          test -f research/00-linux-livepatch-internals.md
+          test -f research/01-continuous-rerandomization-prior-art.md
+          test -f research/02-honeytrap-old-code-prior-art.md
+          echo "Research dossiers present."
+
+      - name: Validate kernel config fragments referenced from scripts exist
+        run: |
+          test -f kernel/livepatch.config
+          test -f kernel/randomize.config
+          echo "Config fragments present."
+
+      - name: Validate livepatch source files compile-readily
+        run: |
+          test -f livepatches/lp_template.c
+          test -f livepatches/lp1.c
+          test -f livepatches/lp2.c
+          test -f livepatches/attacker.c
+          test -f livepatches/Makefile
+          # The template must contain the @NN@ and @MSG@ placeholders.
+          grep -q "@NN@" livepatches/lp_template.c
+          grep -q "@MSG@" livepatches/lp_template.c
+          echo "Livepatch sources present."
